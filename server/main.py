@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
+from datetime import datetime, timedelta
 from pydantic import BaseModel
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
@@ -80,6 +81,8 @@ class Order(BaseModel):
     actual_delivery: Optional[str] = None
     warehouse: Optional[str] = None
     category: Optional[str] = None
+    # Populated only for internal restocking orders (see POST /api/orders/restock)
+    lead_time_days: Optional[int] = None
 
 class DemandForecast(BaseModel):
     id: str
@@ -89,6 +92,8 @@ class DemandForecast(BaseModel):
     forecasted_demand: int
     trend: str
     period: str
+    unit_cost: float
+    lead_time_days: int
 
 class BacklogItem(BaseModel):
     id: str
@@ -119,6 +124,17 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+class RestockOrderItem(BaseModel):
+    item_sku: str
+    item_name: str
+    quantity: int
+    unit_cost: float
+    lead_time_days: int
+
+class CreateRestockOrderRequest(BaseModel):
+    budget: float
+    items: List[RestockOrderItem]
 
 # API endpoints
 @app.get("/")
@@ -152,6 +168,56 @@ def get_orders(
     filtered_orders = apply_filters(orders, warehouse, category, status)
     filtered_orders = filter_by_month(filtered_orders, month)
     return filtered_orders
+
+@app.post("/api/orders/restock", response_model=Order)
+def create_restock_order(request: CreateRestockOrderRequest):
+    """Create an internal restocking order from budget-based recommendations.
+
+    Appended to the in-memory orders list so it surfaces via GET /api/orders
+    (as a 'Restocking' status order). Not persisted to disk.
+    """
+    if not request.items:
+        raise HTTPException(status_code=400, detail="Restock order must contain at least one item")
+
+    total_value = round(sum(item.quantity * item.unit_cost for item in request.items), 2)
+    if total_value > request.budget:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Order total {total_value} exceeds budget {request.budget}"
+        )
+
+    # Delivery lead time for the whole order is the slowest item in it
+    lead_time_days = max(item.lead_time_days for item in request.items)
+    now = datetime.now()
+
+    next_id = max((int(o["id"]) for o in orders), default=0) + 1
+    restock_count = sum(1 for o in orders if o.get("status") == "Restocking") + 1
+
+    new_order = {
+        "id": str(next_id),
+        "order_number": f"RST-2025-{restock_count:04d}",
+        "customer": "Internal Restock",
+        "items": [
+            {
+                "sku": item.item_sku,
+                "name": item.item_name,
+                "quantity": item.quantity,
+                "unit_price": item.unit_cost,
+            }
+            for item in request.items
+        ],
+        "status": "Restocking",
+        "order_date": now.isoformat(timespec="seconds"),
+        "expected_delivery": (now + timedelta(days=lead_time_days)).isoformat(timespec="seconds"),
+        "total_value": total_value,
+        "actual_delivery": None,
+        "warehouse": None,
+        "category": None,
+        "lead_time_days": lead_time_days,
+    }
+
+    orders.append(new_order)
+    return new_order
 
 @app.get("/api/orders/{order_id}", response_model=Order)
 def get_order(order_id: str):
